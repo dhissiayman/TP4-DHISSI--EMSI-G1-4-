@@ -16,15 +16,18 @@ import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2.AllMiniLmL6V2EmbeddingModel;
 import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
 import dev.langchain4j.model.output.Response;
-import dev.langchain4j.rag.RetrievalAugmentor;
 import dev.langchain4j.rag.DefaultRetrievalAugmentor;
+import dev.langchain4j.rag.RetrievalAugmentor;
 import dev.langchain4j.rag.content.retriever.ContentRetriever;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
-import dev.langchain4j.rag.query.router.LanguageModelQueryRouter;
+import dev.langchain4j.rag.content.retriever.WebSearchContentRetriever;
+import dev.langchain4j.rag.query.router.DefaultQueryRouter;
 import dev.langchain4j.rag.query.router.QueryRouter;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
+import dev.langchain4j.web.search.WebSearchEngine;
+import dev.langchain4j.web.search.tavily.TavilyWebSearchEngine;
 import jakarta.enterprise.context.Dependent;
 import ma.emsi.dhissiayman.tp4.tp4dhissiayman.assistant.Assistant;
 
@@ -34,7 +37,6 @@ import java.net.URL;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
-import java.util.Map;
 
 @Dependent
 public class LlmClient implements Serializable {
@@ -59,7 +61,7 @@ public class LlmClient implements Serializable {
     // =========================
 
     /**
-     * Ingestion d’un PDF dans un EmbeddingStore (reprend la logique de Test3Routage).
+     * Ingestion d’un PDF dans un EmbeddingStore (logique similaire à tes tests).
      */
     private static EmbeddingStore<TextSegment> ingestPdfAsEmbeddingStore(
             Class<?> resourceOwner,
@@ -95,34 +97,25 @@ public class LlmClient implements Serializable {
     }
 
     /**
-     * Initialisation statique du RAG multi-documents avec routage LLM.
+     * Initialisation statique du RAG multi-PDF + Web (Tavily).
      * Appelée une seule fois (synchronisée) pour toute la JVM.
      */
-    private static synchronized void ensureRagInitialized(String apiKey) {
+    private static synchronized void ensureRagInitialized(String apiKeyGemini) {
         if (ragInitialized && retrievalAugmentor != null) {
             return;
         }
 
-        // Modèle de chat utilisé pour le routage des requêtes (et éventuellement pour d'autres usages)
-        ChatModel routingChatModel = GoogleAiGeminiChatModel.builder()
-                .apiKey(apiKey)
-                .modelName("gemini-2.5-flash")
-                .temperature(0.3)
-                .logRequestsAndResponses(true)
-                .build();
-
-        // Modèle d'embedding partagé par les deux sources
+        // Modèle d'embedding partagé
         EmbeddingModel embeddingModel = new AllMiniLmL6V2EmbeddingModel();
 
-        // --------- PHASE 1 : ingestion des 2 PDFs ---------
-        // Adapte les noms aux PDF que tu as mis dans src/main/resources
+        // --------- PHASE 1 : ingestion de 2 PDFs ---------
         EmbeddingStore<TextSegment> iaStore =
                 ingestPdfAsEmbeddingStore(LlmClient.class, "langchain4j.pdf", embeddingModel);
 
         EmbeddingStore<TextSegment> autreStore =
                 ingestPdfAsEmbeddingStore(LlmClient.class, "QCM_MAD-AI_COMPLET.pdf", embeddingModel);
 
-        // --------- PHASE 2 : 2 ContentRetrievers ---------
+        // --------- PHASE 2 : ContentRetrievers sur les PDFs ---------
         ContentRetriever iaRetriever =
                 EmbeddingStoreContentRetriever.builder()
                         .embeddingStore(iaStore)
@@ -139,21 +132,31 @@ public class LlmClient implements Serializable {
                         .minScore(0.5)
                         .build();
 
-        // Map des descriptions en langage naturel pour le routage
-        Map<ContentRetriever, String> retrieverToDescription = Map.of(
-                iaRetriever,
-                "Documents de cours sur l'IA, les LLM, le RAG, LangChain4j, etc.",
-                autreRetriever,
-                "Documents qui ne parlent pas directement d'IA (autres matières / autres sujets)."
-        );
+        // --------- PHASE 3 : ContentRetriever Web (Tavily) ---------
+        String tavilyKey = System.getenv("TAVILY_API_KEY");
+        if (tavilyKey == null || tavilyKey.isBlank()) {
+            throw new IllegalStateException("La variable d'environnement TAVILY_API_KEY n'est pas définie");
+        }
 
-        // QueryRouter basé sur le LLM (exactement comme dans Test3Routage)
-        QueryRouter queryRouter = LanguageModelQueryRouter.builder()
-                .chatModel(routingChatModel)
-                .retrieverToDescription(retrieverToDescription)
+        WebSearchEngine tavilyEngine = TavilyWebSearchEngine.builder()
+                .apiKey(tavilyKey)
                 .build();
 
-        // RetrievalAugmentor final basé sur ce QueryRouter
+        ContentRetriever webRetriever =
+                WebSearchContentRetriever.builder()
+                        .webSearchEngine(tavilyEngine)
+                        // tu peux ajouter .maxResults(), .includeRawContent(), etc. si besoin
+                        .build();
+
+        // --------- PHASE 4 : QueryRouter combinant PDF1 + PDF2 + Web ---------
+        // DefaultQueryRouter interroge tous les ContentRetrievers fournis.
+        QueryRouter queryRouter = new DefaultQueryRouter(
+                iaRetriever,
+                autreRetriever,
+                webRetriever
+        );
+
+        // --------- PHASE 5 : RetrievalAugmentor final ---------
         retrievalAugmentor = DefaultRetrievalAugmentor.builder()
                 .queryRouter(queryRouter)
                 .build();
@@ -174,7 +177,7 @@ public class LlmClient implements Serializable {
             throw new IllegalStateException("GEMINI_KEY manquante.");
         }
 
-        // Modèle de chat pour les réponses de l'assistant (côté Web)
+        // Modèle de chat pour l'assistant Web
         this.model = GoogleAiGeminiChatModel.builder()
                 .apiKey(apiKey)
                 .modelName("gemini-2.5-flash")
@@ -182,12 +185,12 @@ public class LlmClient implements Serializable {
                 .logRequestsAndResponses(true)
                 .build();
 
-        // Initialisation RAG (ingestion PDF + routage) une seule fois
+        // Initialisation RAG (2 PDFs + Tavily Web)
         ensureRagInitialized(this.apiKey);
 
         this.chatMemory = MessageWindowChatMemory.withMaxMessages(10);
 
-        // Si un rôle système existait avant passivation, on le remet
+        // Remettre le rôle système s'il existait
         if (this.systemRole != null && !this.systemRole.isBlank()) {
             this.chatMemory.add(SystemMessage.from(this.systemRole));
         }
@@ -195,7 +198,7 @@ public class LlmClient implements Serializable {
         // Assistant LangChain4j avec :
         //  - chatModel Gemini
         //  - mémoire
-        //  - RetrievalAugmentor (RAG + routage multi-PDF)
+        //  - RetrievalAugmentor (RAG multi-PDF + Web Tavily)
         this.assistant = AiServices.builder(Assistant.class)
                 .chatModel(this.model)
                 .chatMemory(this.chatMemory)
@@ -209,7 +212,6 @@ public class LlmClient implements Serializable {
 
     public void setSystemRole(String role) {
         this.systemRole = role;
-        // assistant peut être null après passivation -> réinit
         ensureInit();
         this.chatMemory.clear();
         if (role != null && !role.isBlank()) {
