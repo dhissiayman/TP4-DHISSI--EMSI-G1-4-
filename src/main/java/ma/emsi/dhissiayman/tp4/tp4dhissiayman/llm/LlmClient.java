@@ -15,13 +15,15 @@ import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2.AllMiniLmL6V2EmbeddingModel;
 import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
+import dev.langchain4j.model.input.Prompt;
+import dev.langchain4j.model.input.PromptTemplate;
 import dev.langchain4j.model.output.Response;
 import dev.langchain4j.rag.DefaultRetrievalAugmentor;
 import dev.langchain4j.rag.RetrievalAugmentor;
 import dev.langchain4j.rag.content.retriever.ContentRetriever;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
 import dev.langchain4j.rag.content.retriever.WebSearchContentRetriever;
-import dev.langchain4j.rag.query.router.DefaultQueryRouter;
+import dev.langchain4j.rag.query.Query;
 import dev.langchain4j.rag.query.router.QueryRouter;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.store.embedding.EmbeddingStore;
@@ -37,6 +39,7 @@ import java.net.URL;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
+import java.util.Map;
 
 @Dependent
 public class LlmClient implements Serializable {
@@ -60,9 +63,6 @@ public class LlmClient implements Serializable {
     //  RAG : ingestion des PDFs
     // =========================
 
-    /**
-     * Ingestion d’un PDF dans un EmbeddingStore (logique similaire à tes tests).
-     */
     private static EmbeddingStore<TextSegment> ingestPdfAsEmbeddingStore(
             Class<?> resourceOwner,
             String resourceName,
@@ -97,13 +97,20 @@ public class LlmClient implements Serializable {
     }
 
     /**
-     * Initialisation statique du RAG multi-PDF + Web (Tavily).
-     * Appelée une seule fois (synchronisée) pour toute la JVM.
+     * Initialisation statique du RAG multi-PDF + Web (Tavily) + RAG conditionnel.
      */
     private static synchronized void ensureRagInitialized(String apiKeyGemini) {
         if (ragInitialized && retrievalAugmentor != null) {
             return;
         }
+
+        // Modèle utilisé pour le routage conditionnel (comme dans Test4)
+        ChatModel routingChatModel = GoogleAiGeminiChatModel.builder()
+                .apiKey(apiKeyGemini)
+                .modelName("gemini-2.5-flash")
+                .temperature(0.0) // on veut une réponse la plus déterministe possible
+                .logRequestsAndResponses(true)
+                .build();
 
         // Modèle d'embedding partagé
         EmbeddingModel embeddingModel = new AllMiniLmL6V2EmbeddingModel();
@@ -145,18 +152,41 @@ public class LlmClient implements Serializable {
         ContentRetriever webRetriever =
                 WebSearchContentRetriever.builder()
                         .webSearchEngine(tavilyEngine)
-                        // tu peux ajouter .maxResults(), .includeRawContent(), etc. si besoin
                         .build();
 
-        // --------- PHASE 4 : QueryRouter combinant PDF1 + PDF2 + Web ---------
-        // DefaultQueryRouter interroge tous les ContentRetrievers fournis.
-        QueryRouter queryRouter = new DefaultQueryRouter(
-                iaRetriever,
-                autreRetriever,
-                webRetriever
+        // --------- PHASE 4 : PromptTemplate pour décider "RAG ou pas ?" ---------
+        PromptTemplate routerTemplate = PromptTemplate.from(
+                "Est-ce que la requête suivante nécessite d'utiliser le contexte des documents PDF " +
+                        "ou d'effectuer une recherche Web (Tavily) ? " +
+                        "Réponds uniquement par 'oui', 'non' ou 'peut-être'.\n" +
+                        "Requête : {{query}}"
         );
 
-        // --------- PHASE 5 : RetrievalAugmentor final ---------
+        // --------- PHASE 5 : QueryRouter conditionnel ---------
+        QueryRouter queryRouter = new QueryRouter() {
+            @Override
+            public List<ContentRetriever> route(Query query) {
+
+                Prompt prompt = routerTemplate.apply(Map.of(
+                        "query", query.text()
+                ));
+
+                String answer = routingChatModel.chat(prompt.text()).trim().toLowerCase();
+
+                System.out.println("[Router conditionnel] Question utilisateur : " + query.text());
+                System.out.println("[Router conditionnel] Réponse du LM pour le routage : " + answer);
+
+                if (answer.startsWith("non")) {
+                    // ❌ Pas de RAG : ni PDF, ni Web
+                    return List.of();
+                } else {
+                    // ✅ "oui" ou "peut-être" → on utilise toutes les sources (2 PDFs + Web)
+                    return List.of(iaRetriever, autreRetriever, webRetriever);
+                }
+            }
+        };
+
+        // --------- PHASE 6 : RetrievalAugmentor final ---------
         retrievalAugmentor = DefaultRetrievalAugmentor.builder()
                 .queryRouter(queryRouter)
                 .build();
@@ -177,7 +207,7 @@ public class LlmClient implements Serializable {
             throw new IllegalStateException("GEMINI_KEY manquante.");
         }
 
-        // Modèle de chat pour l'assistant Web
+        // Modèle de chat utilisé pour répondre à l'utilisateur (appli Web)
         this.model = GoogleAiGeminiChatModel.builder()
                 .apiKey(apiKey)
                 .modelName("gemini-2.5-flash")
@@ -185,20 +215,15 @@ public class LlmClient implements Serializable {
                 .logRequestsAndResponses(true)
                 .build();
 
-        // Initialisation RAG (2 PDFs + Tavily Web)
+        // Initialisation RAG (multi-PDF + Tavily + RAG conditionnel)
         ensureRagInitialized(this.apiKey);
 
         this.chatMemory = MessageWindowChatMemory.withMaxMessages(10);
 
-        // Remettre le rôle système s'il existait
         if (this.systemRole != null && !this.systemRole.isBlank()) {
             this.chatMemory.add(SystemMessage.from(this.systemRole));
         }
 
-        // Assistant LangChain4j avec :
-        //  - chatModel Gemini
-        //  - mémoire
-        //  - RetrievalAugmentor (RAG multi-PDF + Web Tavily)
         this.assistant = AiServices.builder(Assistant.class)
                 .chatModel(this.model)
                 .chatMemory(this.chatMemory)
